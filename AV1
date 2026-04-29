@@ -1,0 +1,326 @@
+--CARGA
+
+COPY carga_pedidos FROM 'C:\temp\pedidos_teste.csv' DELIMITER ',' CSV HEADER;
+CALL processar_carga();
+CALL processar_movimentacao_estoque();
+
+COPY carga_estoque(sku, quantidade) FROM 'C:\temp\entrega_fornecedor_teste.csv' CSV HEADER;
+CALL importar_estoque_csv();
+
+-- TABELAS
+
+CREATE TABLE IF NOT EXISTS clientes (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    nome VARCHAR(255) NOT NULL,
+    cpf VARCHAR(20),
+    telefone VARCHAR(50),
+    criado_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    atualizado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS produtos (
+    id SERIAL PRIMARY KEY,
+    sku VARCHAR(100) NOT NULL UNIQUE,
+    nome VARCHAR(500) NOT NULL,
+    estoque NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (estoque >= 0),
+    criado_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    atualizado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS pedidos (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(100) NOT NULL UNIQUE,
+    cliente_id INTEGER NOT NULL REFERENCES clientes(id),
+    purchase_date TIMESTAMP,
+    payments_date TIMESTAMP,
+    ship_service_level VARCHAR(100),
+    recipient_name VARCHAR(255),
+    ship_address_1 VARCHAR(255),
+    ship_address_2 VARCHAR(255),
+    ship_address_3 VARCHAR(255),
+    ship_city VARCHAR(100),
+    ship_state VARCHAR(100),
+    ship_postal_code VARCHAR(30),
+    ship_country VARCHAR(10),
+    ioss_number VARCHAR(100),
+    valor_total NUMERIC(14,2) NOT NULL DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'NOVO' CHECK (status IN ('ATENDIDO','PENDENTE')),
+    criado_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    atualizado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS itens_pedido (
+    id SERIAL PRIMARY KEY,
+    pedido_id INTEGER NOT NULL REFERENCES pedidos(id),
+    produto_id INTEGER NOT NULL REFERENCES produtos(id),
+    order_item_id VARCHAR(100) NOT NULL UNIQUE,
+    quantity_purchased NUMERIC(12,2) NOT NULL,
+    currency VARCHAR(10),
+    item_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+    criado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- TABELAS DE CARGA
+
+CREATE TABLE IF NOT EXISTS carga_pedidos (
+    id SERIAL PRIMARY KEY,
+    "order-id" VARCHAR(100),
+    "order-item-id" VARCHAR(100),
+    "purchase-date" VARCHAR(50),
+    "payments-date" VARCHAR(50),
+    "buyer-email" VARCHAR(255),
+    "buyer-name" VARCHAR(255),
+    "cpf" VARCHAR(20),
+    "buyer-phone-number" VARCHAR(50),
+    "sku" VARCHAR(100),
+    "product-name" VARCHAR(500),
+    "quantity-purchased" VARCHAR(50),
+    "currency" VARCHAR(10),
+    "item-price" VARCHAR(50),
+    "ship-service-level" VARCHAR(100),
+    "recipient-name" VARCHAR(255),
+    "ship-address-1" VARCHAR(255),
+    "ship-address-2" VARCHAR(255),
+    "ship-address-3" VARCHAR(255),
+    "ship-city" VARCHAR(100),
+    "ship-state" VARCHAR(100),
+    "ship-postal-code" VARCHAR(30),
+    "ship-country" VARCHAR(10),
+    "ioss-number" VARCHAR(100),
+    processado BOOLEAN NOT NULL DEFAULT FALSE,
+    importado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS carga_estoque (
+    id SERIAL PRIMARY KEY,
+    sku VARCHAR(100) NOT NULL,
+    quantidade VARCHAR(50) NOT NULL,
+    processado BOOLEAN NOT NULL DEFAULT FALSE,
+    importado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS movimentacao_estoque (
+    id SERIAL PRIMARY KEY,
+    produto_id INTEGER NOT NULL REFERENCES produtos(id),
+    pedido_id INTEGER REFERENCES pedidos(id),
+    tipo VARCHAR(10) NOT NULL CHECK (tipo IN ('SAIDA','ENTRADA')),
+    quantidade NUMERIC(12,2) NOT NULL,
+    saldo_antes NUMERIC(12,2) NOT NULL,
+    saldo_depois NUMERIC(12,2) NOT NULL,
+    observacao TEXT,
+    criado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS compras (
+    id SERIAL PRIMARY KEY,
+    produto_id INTEGER NOT NULL REFERENCES produtos(id),
+    pedido_id INTEGER NOT NULL REFERENCES pedidos(id),
+    quantidade NUMERIC(12,2) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDENTE' CHECK (status IN ('PENDENTE','RECEBIDA','CANCELADA')),
+    criado_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    atualizado_em TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- FUNÇÕES AUXILIARES
+
+CREATE OR REPLACE FUNCTION safe_numeric(p TEXT) RETURNS NUMERIC AS $$
+BEGIN 
+    RETURN REPLACE(p, ',', '.')::NUMERIC; 
+EXCEPTION WHEN OTHERS THEN 
+    RETURN 0; 
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION safe_timestamp(p TEXT) RETURNS TIMESTAMP AS $$
+BEGIN 
+    RETURN p::TIMESTAMP; 
+EXCEPTION WHEN OTHERS THEN 
+    RETURN NULL; 
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- PROCEDURES
+
+CREATE OR REPLACE PROCEDURE processar_carga()
+LANGUAGE plpgsql AS $$
+DECLARE
+    cur_carga CURSOR FOR
+        SELECT * FROM carga_pedidos WHERE processado = FALSE ORDER BY "order-id", id;
+    rec carga_pedidos%ROWTYPE;
+    v_carga_id INTEGER;
+    v_cliente_id INTEGER;
+    v_produto_id INTEGER;
+    v_pedido_id INTEGER;
+BEGIN
+    OPEN cur_carga;
+    LOOP
+        FETCH cur_carga INTO rec;
+        EXIT WHEN NOT FOUND;
+        v_carga_id := rec.id;
+
+        INSERT INTO clientes (email, nome, cpf, telefone)
+        SELECT rec."buyer-email", rec."buyer-name", rec."cpf", rec."buyer-phone-number"
+        WHERE NOT EXISTS (SELECT 1 FROM clientes WHERE email = rec."buyer-email");
+        SELECT id INTO v_cliente_id FROM clientes WHERE email = rec."buyer-email";
+
+        INSERT INTO produtos (sku, nome)
+        SELECT rec."sku", rec."product-name"
+        WHERE NOT EXISTS (SELECT 1 FROM produtos WHERE sku = rec."sku");
+        SELECT id INTO v_produto_id FROM produtos WHERE sku = rec."sku";
+
+        INSERT INTO pedidos (order_id, cliente_id, purchase_date, payments_date,
+            ship_service_level, recipient_name, ship_address_1, ship_address_2,
+            ship_address_3, ship_city, ship_state, ship_postal_code, ship_country, ioss_number)
+        SELECT rec."order-id", v_cliente_id, safe_timestamp(rec."purchase-date"),
+            safe_timestamp(rec."payments-date"), rec."ship-service-level",
+            rec."recipient-name", rec."ship-address-1", rec."ship-address-2",
+            rec."ship-address-3", rec."ship-city", rec."ship-state",
+            rec."ship-postal-code", rec."ship-country", rec."ioss-number"
+        WHERE NOT EXISTS (SELECT 1 FROM pedidos WHERE order_id = rec."order-id");
+        SELECT id INTO v_pedido_id FROM pedidos WHERE order_id = rec."order-id";
+
+        INSERT INTO itens_pedido (pedido_id, produto_id, order_item_id, quantity_purchased, currency, item_price)
+        SELECT v_pedido_id, v_produto_id, rec."order-item-id",
+            safe_numeric(rec."quantity-purchased"), rec."currency", safe_numeric(rec."item-price")
+        WHERE NOT EXISTS (SELECT 1 FROM itens_pedido WHERE order_item_id = rec."order-item-id");
+
+        UPDATE carga_pedidos SET processado = TRUE WHERE id = v_carga_id;
+    END LOOP;
+    CLOSE cur_carga;
+
+    UPDATE pedidos p
+    SET valor_total = sub.total, atualizado_em = NOW()
+    FROM (SELECT pedido_id, SUM(item_price * quantity_purchased) AS total
+          FROM itens_pedido GROUP BY pedido_id) sub
+    WHERE p.id = sub.pedido_id;
+
+    RAISE NOTICE 'processar_carga: concluído.';
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE processar_movimentacao_estoque()
+LANGUAGE plpgsql AS $$
+DECLARE
+    cur_pedidos CURSOR FOR
+        SELECT id, order_id FROM pedidos
+        WHERE status IN ('PENDENTE') ORDER BY valor_total DESC;
+
+    cur_verifica CURSOR (p_id INTEGER) FOR
+        SELECT ip.produto_id, ip.quantity_purchased, pr.estoque, pr.sku
+        FROM itens_pedido ip JOIN produtos pr ON pr.id = ip.produto_id
+        WHERE ip.pedido_id = p_id;
+
+    cur_itens CURSOR (p_id INTEGER) FOR
+        SELECT ip.produto_id, ip.quantity_purchased, pr.estoque
+        FROM itens_pedido ip JOIN produtos pr ON pr.id = ip.produto_id
+        WHERE ip.pedido_id = p_id;
+
+    rec_pedido RECORD;
+    rec_verifica RECORD;
+    rec_item RECORD;
+    v_ok BOOLEAN;
+    v_antes NUMERIC(12,2);
+    v_depois NUMERIC(12,2);
+BEGIN
+    OPEN cur_pedidos;
+    LOOP
+        FETCH cur_pedidos INTO rec_pedido;
+        EXIT WHEN NOT FOUND;
+        v_ok := TRUE;
+
+        OPEN cur_verifica(rec_pedido.id);
+        LOOP
+            FETCH cur_verifica INTO rec_verifica;
+            EXIT WHEN NOT FOUND;
+            IF rec_verifica.estoque < rec_verifica.quantity_purchased THEN
+                v_ok := FALSE;
+                INSERT INTO compras (produto_id, pedido_id, quantidade)
+                SELECT rec_verifica.produto_id, rec_pedido.id,
+                       rec_verifica.quantity_purchased - rec_verifica.estoque
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM compras
+                    WHERE produto_id = rec_verifica.produto_id
+                      AND pedido_id  = rec_pedido.id
+                );
+            END IF;
+        END LOOP;
+        CLOSE cur_verifica;
+
+        IF v_ok THEN
+            OPEN cur_itens(rec_pedido.id);
+            LOOP
+                FETCH cur_itens INTO rec_item;
+                EXIT WHEN NOT FOUND;
+                SELECT estoque INTO v_antes FROM produtos
+                WHERE id = rec_item.produto_id FOR UPDATE;
+                v_depois := v_antes - rec_item.quantity_purchased;
+                
+                INSERT INTO movimentacao_estoque
+                    (produto_id, pedido_id, tipo, quantidade, saldo_antes, saldo_depois, observacao)
+                VALUES (rec_item.produto_id, rec_pedido.id, 'SAIDA',
+                        rec_item.quantity_purchased, v_antes, v_depois,
+                        'Atendimento pedido ' || rec_pedido.order_id);
+                
+                UPDATE produtos SET estoque = v_depois, atualizado_em = NOW()
+                WHERE id = rec_item.produto_id;
+            END LOOP;
+            CLOSE cur_itens;
+            UPDATE pedidos SET status = 'ATENDIDO', atualizado_em = NOW()
+            WHERE id = rec_pedido.id;
+        ELSE
+            UPDATE pedidos SET status = 'PENDENTE', atualizado_em = NOW()
+            WHERE id = rec_pedido.id;
+        END IF;
+    END LOOP;
+    CLOSE cur_pedidos;
+    RAISE NOTICE 'processar_movimentacao_estoque: concluído.';
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE importar_estoque_csv()
+LANGUAGE plpgsql AS $$
+DECLARE
+    cur_carga CURSOR FOR SELECT * FROM carga_estoque WHERE processado = FALSE;
+    rec carga_estoque%ROWTYPE;
+    v_carga_id INTEGER;
+    v_produto_id INTEGER;
+    v_antes NUMERIC(12,2);
+    v_depois NUMERIC(12,2);
+BEGIN
+    OPEN cur_carga;
+    LOOP
+        FETCH cur_carga INTO rec;
+        EXIT WHEN NOT FOUND;
+        v_carga_id := rec.id;
+
+        SELECT id, estoque INTO v_produto_id, v_antes
+        FROM produtos WHERE sku = rec.sku FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE WARNING 'SKU % não encontrado — linha ignorada.', rec.sku;
+            UPDATE carga_estoque SET processado = TRUE WHERE id = v_carga_id;
+            CONTINUE;
+        END IF;
+
+        v_depois := v_antes + safe_numeric(rec.quantidade);
+
+        INSERT INTO movimentacao_estoque
+            (produto_id, pedido_id, tipo, quantidade, saldo_antes, saldo_depois, observacao)
+        VALUES (v_produto_id, NULL, 'ENTRADA', safe_numeric(rec.quantidade),
+                v_antes, v_depois, 'Recebimento fornecedor — carga id ' || rec.id);
+
+        UPDATE produtos SET estoque = v_depois, atualizado_em = NOW()
+        WHERE id = v_produto_id;
+
+        UPDATE compras SET status = 'RECEBIDA', atualizado_em = NOW()
+        WHERE produto_id = v_produto_id AND status = 'PENDENTE';
+
+        UPDATE carga_estoque SET processado = TRUE WHERE id = v_carga_id;
+    END LOOP;
+    CLOSE cur_carga;
+
+    CALL processar_movimentacao_estoque();
+    RAISE NOTICE 'importar_estoque_csv: concluído.';
+END;
+$$;
